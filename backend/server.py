@@ -6,10 +6,11 @@ import requests
 load_dotenv()
 
 API_KEY = os.getenv("PYNOTE_API_KEY")
+NGROK_URL = os.getenv("NGROK_URL")
 
 url = "https://api.pyannote.ai/v1/diarize"
 file_url = "https://drive.google.com/uc?export=download&id=1M14A0srvzOtuViJbe1R7NI9Drxj6Jtpl"
-webhook_url = 'https://507e5e76817a.ngrok.app/webhook'
+webhook_url = f"{NGROK_URL}/webhook"
 
 headers = {
    "Authorization": f"Bearer {API_KEY}"
@@ -26,3 +27,4 @@ print(response.status_code)
 print(response.json()) 
 
 # VAF = verarbeitete Audio File
+# RVAV = Raw verarbeitete Audio File
