@@ -4,8 +4,9 @@ const http = require("http");
 const { Server } = require("socket.io");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
-// ---- ffmpeg / ffprobe (robust, aber kein Verbindungs-Blocker) ----
+// ---- ffmpeg / ffprobe ----
 const ffmpeg = require("fluent-ffmpeg");
 let ffmpegReady = false;
 try {
@@ -19,35 +20,35 @@ try {
 }
 
 const PORT = process.env.PORT || 5000;
-const AUDIO_DIR = path.resolve(__dirname, "audio-chunks");
-fs.mkdirSync(AUDIO_DIR, { recursive: true });
+// Speichere NUR MP3s hier
+const OUTPUT_DIR = path.resolve(__dirname, "audio-chunks");
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const app = express();
 const server = http.createServer(app);
 
+// (Kein Abspiel-Endpoint nötig; falls gewünscht, könnte man OUTPUT_DIR statisch ausliefern)
+// app.use("/audio", express.static(OUTPUT_DIR));
+
 const io = new Server(server, {
   cors: {
-    origin: (origin, cb) => cb(null, true), // dev-freundlich
+    origin: (origin, cb) => cb(null, true),
     methods: ["GET", "POST"],
     credentials: true,
   },
   transports: ["websocket", "polling"],
-  maxHttpBufferSize: 1e8,  // ~100 MB
+  maxHttpBufferSize: 1e8,
   pingInterval: 25000,
   pingTimeout: 20000,
 });
 
 // ---------- Helpers ----------
 const pad = (n) => String(n).padStart(2, "0");
-// Format: Sekunde-Minute-Stunde_Tag-Monat-Jahr
 function dateBaseName(d = new Date()) {
-  const sec = pad(d.getSeconds());
-  const min = pad(d.getMinutes());
-  const hour = pad(d.getHours());
-  const day = pad(d.getDate());
-  const month = pad(d.getMonth() + 1);
-  const year = d.getFullYear();
-  return `${sec}-${min}-${hour}_${day}-${month}-${year}`;
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(
+    d.getMinutes()
+  )}-${pad(d.getSeconds())}-${ms}`;
 }
 
 function extFromMime(m) {
@@ -61,14 +62,13 @@ function extFromMime(m) {
   return "bin";
 }
 
-// <<< WICHTIG: egal was der Client schickt (Buffer/ArrayBuffer/Array),
-// wir konvertieren sauber in einen Node-Buffer >>>
 function toBuffer(raw) {
-  // Socket.IO v4 liefert Binary i.d.R. als Buffer oder ArrayBuffer
+  if (!raw) throw new Error("empty audio payload");
   if (Buffer.isBuffer(raw)) return raw;
   if (raw && raw.type === "Buffer" && Array.isArray(raw.data)) return Buffer.from(raw.data);
   if (raw instanceof ArrayBuffer) return Buffer.from(new Uint8Array(raw));
   if (Array.isArray(raw)) return Buffer.from(Uint8Array.from(raw));
+  if (ArrayBuffer.isView(raw)) return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
   throw new Error("unsupported audioData type");
 }
 
@@ -78,13 +78,13 @@ function transcodeToMp3(inputPath, outputPath) {
     ffmpeg(inputPath)
       .noVideo()
       .audioCodec("libmp3lame")
-      .audioBitrate(192)     // CBR 192kbps
-      .audioChannels(1)      // Mono
-      .audioFrequency(44100) // 44.1kHz
+      .audioBitrate(192)
+      .audioChannels(1)
+      .audioFrequency(44100)
       .format("mp3")
       .on("start", (cmd) => console.log("[ffmpeg]", cmd))
-      .on("end", resolve)
-      .on("error", reject)
+      .on("end", () => resolve())
+      .on("error", (err) => reject(err))
       .save(outputPath);
   });
 }
@@ -120,61 +120,65 @@ io.on("connection", (socket) => {
   console.log(`[conn] ${socket.id} from ${ip} — total: ${connected}`);
 
   socket.on("client:audio", async (payload = {}) => {
+    let tmpSrcPath = null;
     try {
-      const { audioData, mimeType, fileName } = payload;
-
-      // 1) Bytes robust in Buffer wandeln
-      const buf = toBuffer(audioData);
+      const raw = payload.audioBuffer ?? payload.audioData ?? null;
+      const buf = toBuffer(raw);
       if (!buf || buf.length === 0) throw new Error("no audio data");
 
-      // 2) Eingangsdatei speichern (mit ursprünglicher Extension, zur Diagnose behalten)
-      const srcExt = fileName && path.extname(fileName).slice(1)
-        ? path.extname(fileName).slice(1)
-        : extFromMime(mimeType);
+      if (!ffmpegReady) {
+        throw new Error("Transcoding not available (ffmpeg/ffprobe not configured)");
+      }
+
+      const mimeType = (payload.mimeType || "").toString();
+      const clientFileName = payload.fileName ? path.basename(payload.fileName) : "";
+      const srcExt =
+        clientFileName && path.extname(clientFileName).slice(1)
+          ? path.extname(clientFileName).slice(1)
+          : extFromMime(mimeType);
+
       const base = dateBaseName(new Date());
-      const srcName = `${base}_src.${srcExt}`;
-      const srcPath = path.join(AUDIO_DIR, srcName);
-      await fs.promises.writeFile(srcPath, buf);
 
-      // 3) Transcodieren nach MP3
+      // 1) Source TEMPORÄR im OS-Temp speichern (nicht im Zielordner!)
+      tmpSrcPath = path.join(os.tmpdir(), `${base}_src.${srcExt}`);
+      await fs.promises.writeFile(tmpSrcPath, buf);
+
+      // 2) Transkodieren → NUR MP3 ins video-chunks
       const finalName = `${base}.mp3`;
-      const finalPath = path.join(AUDIO_DIR, finalName);
-      await transcodeToMp3(srcPath, finalPath);
+      const finalPath = path.join(OUTPUT_DIR, finalName);
+      await transcodeToMp3(tmpSrcPath, finalPath);
 
-      // 4) Validieren
+      // 3) Validieren
       const meta = await probe(finalPath);
       const stat = await fs.promises.stat(finalPath).catch(() => null);
-
       if (!stat || stat.size === 0) {
         await fs.promises.unlink(finalPath).catch(() => {});
         throw new Error("mp3 size is 0 bytes");
       }
-      if (ffmpegReady) {
-        if (meta.duration < 0.2) {
-          await fs.promises.unlink(finalPath).catch(() => {});
-          throw new Error(`invalid duration ${meta.duration}s`);
-        }
-        if (meta.channels < 1) {
-          await fs.promises.unlink(finalPath).catch(() => {});
-          throw new Error("no audio channels detected");
-        }
+      if (meta.duration < 0.2 || meta.channels < 1) {
+        await fs.promises.unlink(finalPath).catch(() => {});
+        throw new Error(`invalid audio (duration=${meta.duration}s, channels=${meta.channels})`);
       }
 
-      // (Optional) Original behalten — hilft enorm beim Debuggen
-      // Wenn du unbedingt löschen willst: await fs.promises.unlink(srcPath).catch(() => {});
-
       console.log(
-        `[OK] ${finalName} (${stat.size} bytes${ffmpegReady ? `, ${meta.duration.toFixed(2)}s, ${meta.sample_rate}Hz, ch=${meta.channels}` : ""})`
+        `[OK] ${finalName} (${stat.size} bytes, ${meta.duration.toFixed(2)}s, ${meta.sample_rate}Hz, ch=${meta.channels})`
       );
       socket.emit("server:save_ack", {
         ok: true,
         fileName: finalName,
         bytes: stat.size,
-        ...(ffmpegReady ? { duration: meta.duration, sampleRate: meta.sample_rate, channels: meta.channels } : {}),
+        duration: meta.duration,
+        sampleRate: meta.sample_rate,
+        channels: meta.channels,
       });
     } catch (err) {
       console.error(`[FAIL] ${err?.message || err}`);
       socket.emit("server:save_ack", { ok: false, error: String(err?.message || err) });
+    } finally {
+      // 4) TEMP-Quelle IMMER löschen → im Zielordner liegt nur MP3
+      if (tmpSrcPath) {
+        await fs.promises.unlink(tmpSrcPath).catch(() => {});
+      }
     }
   });
 
@@ -184,7 +188,7 @@ io.on("connection", (socket) => {
   });
 });
 
-// Auf 0.0.0.0 binden
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Socket server listening on http://localhost:${PORT}`);
+  console.log(`MP3-Output: ${OUTPUT_DIR}`);
 });

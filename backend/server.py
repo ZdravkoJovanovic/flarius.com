@@ -9,7 +9,7 @@ API_KEY = os.getenv("PYNOTE_API_KEY")
 NGROK_URL = os.getenv("NGROK_URL")
 
 url = "https://api.pyannote.ai/v1/diarize"
-file_url = "https://drive.google.com/uc?export=download&id=1M14A0srvzOtuViJbe1R7NI9Drxj6Jtpl"
+file_url = "https://drive.google.com/uc?export=download&id=1jzfDy3-XyXUa3qbMKJywSkFf9j1sAjXP"
 webhook_url = f"{NGROK_URL}/webhook"
 
 headers = {

@@ -3,17 +3,30 @@
 import { useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
 
-// HMR/Dev: eine einzige Socket-Verbindung pro Tab behalten
 declare global {
   interface Window {
     __SOCKET__?: Socket;
   }
 }
 
+type SaveAck =
+  | {
+      ok: true;
+      fileName: string;
+      bytes: number;
+      duration?: number;
+      sampleRate?: number;
+      channels?: number;
+    }
+  | {
+      ok: false;
+      error?: string;
+    };
+
 export default function Home() {
   // --- Socket Status ---
   const [sockStatus, setSockStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
-  const [saveAck, setSaveAck] = useState<null | { ok: boolean; fileName?: string; bytes?: number; error?: string }>(null);
+  const [saveAck, setSaveAck] = useState<SaveAck | null>(null);
 
   // --- Audio UI/State ---
   const [hasPermission, setHasPermission] = useState(false);
@@ -25,6 +38,7 @@ export default function Home() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
+  const chosenMimeRef = useRef<string>("");
 
   // =========================
   // Socket direkt zu :5000
@@ -36,13 +50,13 @@ export default function Home() {
       s.off("connect").on("connect", () => setSockStatus("connected"));
       s.off("disconnect").on("disconnect", () => setSockStatus("disconnected"));
       s.off("connect_error").on("connect_error", () => setSockStatus("disconnected"));
-      s.off("server:save_ack").on("server:save_ack", (ack) => setSaveAck(ack));
+      s.off("server:save_ack").on("server:save_ack", (ack: SaveAck) => setSaveAck(ack));
       return;
     }
 
     const socket = io("http://localhost:5000", {
-      transports: ["websocket", "polling"], // Polling als Fallback zulassen
-      path: "/socket.io",                   // explizit (Default), gut für Proxies
+      transports: ["websocket", "polling"],
+      path: "/socket.io",
       withCredentials: true,
       reconnection: true,
       reconnectionAttempts: 10,
@@ -56,7 +70,7 @@ export default function Home() {
     socket.on("connect", () => setSockStatus("connected"));
     socket.on("disconnect", () => setSockStatus("disconnected"));
     socket.on("connect_error", () => setSockStatus("disconnected"));
-    socket.on("server:save_ack", (ack) => setSaveAck(ack));
+    socket.on("server:save_ack", (ack: SaveAck) => setSaveAck(ack));
 
     const onUnload = () => {
       try {
@@ -67,7 +81,7 @@ export default function Home() {
 
     return () => {
       window.removeEventListener("beforeunload", onUnload);
-      // KEIN socket.close() hier, damit HMR nicht doppelte Connect-Logs erzeugt.
+      // KEIN socket.close() hier (HMR)
     };
   }, []);
 
@@ -78,8 +92,9 @@ export default function Home() {
     const candidates = [
       "audio/webm;codecs=opus",
       "audio/webm",
-      "audio/mp4",   // Safari
-      "audio/mpeg",  // MP3 (selten via MediaRecorder)
+      "audio/mp4", // Safari
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
     ];
     for (const type of candidates) {
       if ((window as any).MediaRecorder && MediaRecorder.isTypeSupported(type)) return type;
@@ -138,10 +153,12 @@ export default function Home() {
 
       const mimeType = getSupportedMimeType();
       const options = mimeType ? { mimeType } : undefined;
+      chosenMimeRef.current = mimeType || "";
+
       const mr = new MediaRecorder(streamRef.current!, options);
       mediaRecorderRef.current = mr;
       audioChunksRef.current = [];
-      setSaveAck(null); // altes Ack zurücksetzen
+      setSaveAck(null);
 
       mr.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
@@ -150,7 +167,6 @@ export default function Home() {
       };
       mr.onerror = (e) => console.error("MediaRecorder Fehler:", e);
 
-      // alle 1s Chunks sammeln (Versand erfolgt NACH Stop)
       mr.start(1000);
       setRecording(true);
       startTimer();
@@ -167,23 +183,24 @@ export default function Home() {
 
     mediaRecorderRef.current.onstop = async () => {
       try {
-        const mimeType = mediaRecorderRef.current?.mimeType || "audio/webm";
+        const mimeType = chosenMimeRef.current || mediaRecorderRef.current?.mimeType || "audio/webm";
         const blob = new Blob(audioChunksRef.current, { type: mimeType });
 
-        // Dateiendung bestimmen
+        // Dateiendung nur kosmetisch (Info)
         let extension = ".webm";
-        if (mimeType.includes("mp4")) extension = ".mp4";
-        if (mimeType.includes("mpeg")) extension = ".mp3";
+        const lower = mimeType.toLowerCase();
+        if (lower.includes("mp4")) extension = ".mp4";
+        else if (lower.includes("mpeg")) extension = ".mp3";
+        else if (lower.includes("ogg")) extension = ".ogg";
+        else if (lower.includes("wav")) extension = ".wav";
 
-        // Bytes bauen
+        // Binär senden (ArrayBuffer)
         const arrayBuffer = await blob.arrayBuffer();
-        const bytes = Array.from(new Uint8Array(arrayBuffer));
 
         const socket = window.__SOCKET__;
         if (socket && socket.connected) {
-          // Audio-Daten an 5000 senden → Server speichert in ./audio-chunks
           socket.emit("client:audio", {
-            audioData: bytes,
+            audioBuffer: arrayBuffer,
             fileName: `recording_${Date.now()}${extension}`,
             mimeType,
           });
@@ -196,7 +213,6 @@ export default function Home() {
         console.error("Fehler beim Finalisieren/Versenden:", e);
         setSaveAck({ ok: false, error: String(e?.message || e) });
       } finally {
-        // Chunks leeren, Stream behalten (erneute Aufnahme ohne neue Permission)
         audioChunksRef.current = [];
         setRecording(false);
         stopTimer();
@@ -228,7 +244,7 @@ export default function Home() {
   }, []);
 
   // =========================
-  // UI
+  // UI (ohne Abspielen)
   // =========================
   return (
     <div className="fixed inset-0 bg-black text-white flex items-center justify-center">
@@ -245,9 +261,7 @@ export default function Home() {
         <div className="rounded-2xl border border-white/10 bg-white/5 p-5 flex flex-col items-center gap-4">
           {!hasPermission ? (
             <>
-              <div className="text-center text-sm opacity-80">
-                Erteile Zugriff auf dein Mikrofon, um aufzunehmen.
-              </div>
+              <div className="text-center text-sm opacity-80">Erteile Zugriff auf dein Mikrofon, um aufzunehmen.</div>
               <button
                 onClick={requestMic}
                 className="px-6 py-3 font-semibold rounded-md border border-black bg-white text-black transition-colors hover:bg-gray-100"
@@ -275,7 +289,9 @@ export default function Home() {
                 <button
                   onClick={startRecording}
                   disabled={recording}
-                  className={`px-6 py-3 font-semibold rounded-md border border-black bg-white text-black transition-colors hover:bg-gray-100 ${recording ? "opacity-50 cursor-not-allowed" : ""}`}
+                  className={`px-6 py-3 font-semibold rounded-md border border-black bg-white text-black transition-colors hover:bg-gray-100 ${
+                    recording ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
                 >
                   Aufnahme starten
                 </button>
@@ -283,18 +299,25 @@ export default function Home() {
                 <button
                   onClick={stopRecording}
                   disabled={!recording}
-                  className={`px-6 py-3 font-semibold rounded-md border border-black bg-white text-black transition-colors hover:bg-gray-100 ${!recording ? "opacity-50 cursor-not-allowed" : ""}`}
+                  className={`px-6 py-3 font-semibold rounded-md border border-black bg-white text-black transition-colors hover:bg-gray-100 ${
+                    !recording ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
                 >
                   Beenden
                 </button>
               </div>
 
-              {/* Server-Antwort anzeigen */}
+              {/* Server-Antwort anzeigen (ohne Player/Links) */}
               {saveAck && (
-                <div className={`text-sm mt-2 ${saveAck.ok ? "text-green-400" : "text-red-400"}`}>
-                  {saveAck.ok
-                    ? `Gespeichert: ${saveAck.fileName} (${saveAck.bytes} bytes)`
-                    : `Fehlgeschlagen: ${saveAck.error}`}
+                <div className={`text-sm mt-2`}>
+                  {saveAck.ok ? (
+                    <div className="text-green-400">
+                      Gespeichert: {saveAck.fileName} ({saveAck.bytes} bytes
+                      {saveAck.duration ? `, ${saveAck.duration.toFixed(2)}s` : ""})
+                    </div>
+                  ) : (
+                    <div className="text-red-400">Fehlgeschlagen: {saveAck.error}</div>
+                  )}
                 </div>
               )}
             </>
