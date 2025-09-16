@@ -41,12 +41,12 @@ export default function Home() {
     }
 
     const socket = io("http://localhost:5000", {
-      transports: ["websocket"],
-      autoConnect: true,
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 800,
+      transports: ["websocket", "polling"], // Polling als Fallback zulassen
+      path: "/socket.io",                   // explizit (Default), gut für Proxies
       withCredentials: true,
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 800,
     });
 
     if (typeof window !== "undefined") {
